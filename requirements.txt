@@ -1,7 +1,7 @@
-streamlit
-tensorflow-cpu
-opencv-python-headless
-numpy
-pandas
-Pillow
-mediapipe
+streamlit>=1.31.0
+tensorflow>=2.15.0
+opencv-python>=4.9.0
+numpy>=1.26.0
+pandas>=2.1.0
+Pillow>=10.0.0
+mediapipe>=0.10.9
