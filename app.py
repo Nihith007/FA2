@@ -44,7 +44,7 @@ from mediapipe.tasks.python import vision
 # Config
 # ----------------------------------------------------------------------
 IMG_SIZE = (128, 128)
-MODEL_PATH = "fall_detection_model.h5"
+MODEL_PATH = "fall_model.keras"
 CLASS_NAMES_PATH = "class_names.txt"
 POSE_MODEL_PATH = "pose_landmarker.task"
 POSE_MODEL_URL = (
