@@ -34,6 +34,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import tensorflow as tf
+import streamlit as st
+st.write(f"Running TensorFlow version: {tf.__version__}")
 from PIL import Image
 
 import mediapipe as mp
