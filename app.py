@@ -37,8 +37,8 @@ import tensorflow as tf
 from PIL import Image
 
 import mediapipe as mp
-from mediapipe.tasks import python as mp_python
-from mediapipe.tasks.python import vision
+mp_pose = mp.solutions.pose
+mp_drawing = mp.solutions.drawing_utils 
 
 # ----------------------------------------------------------------------
 # Config
