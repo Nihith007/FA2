@@ -94,15 +94,7 @@ def load_class_names():
 
 @st.cache_resource(show_spinner="Loading pose model...")
 def load_pose_detector():
-    if not os.path.exists(POSE_MODEL_PATH):
-        try:
-            urllib.request.urlretrieve(POSE_MODEL_URL, POSE_MODEL_PATH)
-        except Exception as e:
-            st.warning(f"Could not download pose model automatically: {e}")
-            return None
-    base_options = mp_python.BaseOptions(model_asset_path=POSE_MODEL_PATH)
-    options = vision.PoseLandmarkerOptions(base_options=base_options)
-    return vision.PoseLandmarker.create_from_options(options)
+    return mp_pose.Pose(static_image_mode=True, model_complexity=1, min_detection_confidence=0.5)
 
 
 # ----------------------------------------------------------------------
@@ -146,33 +138,15 @@ def classify_array(model, class_names, rgb_array: np.ndarray):
     prob_dict = {name: float(p) for name, p in zip(class_names, probs)}
     return label, prob_dict
 
-
-def draw_pose_on_array(detector, bgr_image: np.ndarray) -> tuple[np.ndarray, bool]:
-    """Runs MediaPipe pose detection on a BGR numpy image and draws the skeleton.
-    Returns (annotated_bgr_image, person_detected)."""
-    if detector is None:
+def draw_pose_on_array(pose_model, bgr_image):
+    if pose_model is None:
         return bgr_image, False
-
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB))
-    result = detector.detect(mp_image)
-
+    rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+    results = pose_model.process(rgb)
     annotated = bgr_image.copy()
-    if not result.pose_landmarks:
+    if not results.pose_landmarks:
         return annotated, False
-
-    h, w, _ = annotated.shape
-    landmarks = result.pose_landmarks[0]  # first detected person
-
-    points = []
-    for lm in landmarks:
-        x, y = int(lm.x * w), int(lm.y * h)
-        points.append((x, y))
-        cv2.circle(annotated, (x, y), 4, (0, 255, 0), -1)
-
-    for start_idx, end_idx in POSE_CONNECTIONS:
-        if start_idx < len(points) and end_idx < len(points):
-            cv2.line(annotated, points[start_idx], points[end_idx], (255, 0, 0), 2)
-
+    mp_drawing.draw_landmarks(annotated, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
     return annotated, True
 
 
