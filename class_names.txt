@@ -2,3 +2,4 @@ Fall
 Sitting
 Standing
 Walking
+Normal
