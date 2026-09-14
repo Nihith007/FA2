@@ -1,3 +1,5 @@
-Falling
-Lying
+Fall
 Normal
+Sitting
+Standing
+Walking
