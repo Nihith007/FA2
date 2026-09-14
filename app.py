@@ -44,8 +44,8 @@ from mediapipe.tasks.python import vision
 # Config
 # ----------------------------------------------------------------------
 IMG_SIZE = (128, 128)
-MODEL_PATH = "fall_detection_model.h5"
-CLASS_NAMES_PATH = "class_names.txt"
+MODEL_PATH = "fall_detection_model.tflite"
+CLASS_NAMES_PATH = "class_names (1).txt"
 POSE_MODEL_PATH = "pose_landmarker.task"
 POSE_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
