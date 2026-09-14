@@ -9,4 +9,5 @@ matplotlib
 seaborn
 scikit-learn
 split-folders
+tensorflow
 
