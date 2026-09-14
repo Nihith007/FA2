@@ -4,7 +4,7 @@ opencv-python-headless>=4.9.0
 numpy>=1.26.0
 pandas>=2.1.0
 Pillow>=10.0.0
-mediapipe>=0.10.9
+mediapipe==0.10.9
 matplotlib
 seaborn
 scikit-learn
