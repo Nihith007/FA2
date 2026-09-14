@@ -141,8 +141,7 @@ def show_fall_alert(label: str, confidence: float):
             f"Confidence: {confidence:.1%}. Notify caregiver / emergency contact immediately."
         )
     else:
-        st.success(f"✅ Normal activity detected: **{label}** ({confidence:.1%} confidence)")
-
+        st.success(f"✅ Activity detected: **{label}** ({confidence:.1%} confidence)")
 
 def render_session_analytics():
     """Monitoring analytics panel: totals, fall count, normal count, distribution chart."""
