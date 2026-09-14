@@ -2,9 +2,9 @@
 Elderly Fall / Activity Detection — Streamlit App (FA-2)
 =========================================================
 Loads the CNN trained in the companion Colab notebook
-(fall_detection_model.h5 + class_names.txt) and lets a caregiver
+(fall_detection_model.tflite + class_names.txt) and lets a caregiver
 upload an image, take a photo, or upload a video to classify activity
-into one of 3 classes: Falling, Lying, Normal.
+into one of 5 classes: Fall, Normal, Sitting, Standing, Walking.
 
 Covers FA-2 Step 7 requirements:
 - Upload images
@@ -19,14 +19,12 @@ Run with:
     streamlit run app.py
 
 Expected files in the same folder as this script:
-    fall_detection_model.h5
+    fall_detection_model.tflite
     class_names.txt
-    pose_landmarker.task   (auto-downloaded on first run if missing)
 """
 
 import os
 import time
-import urllib.request
 from collections import Counter
 
 import cv2
@@ -38,31 +36,16 @@ from PIL import Image
 
 import mediapipe as mp
 mp_pose = mp.solutions.pose
-mp_drawing = mp.solutions.drawing_utils 
+mp_drawing = mp.solutions.drawing_utils
 
 # ----------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------
 IMG_SIZE = (128, 128)
 MODEL_PATH = "fall_detection_model.tflite"
-CLASS_NAMES_PATH = "class_names (1).txt"
-POSE_MODEL_PATH = "pose_landmarker.task"
-POSE_MODEL_URL = (
-    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
-    "pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
-)
-FALL_LABEL = "Falling"        # must match the class name used in class_names.txt
-LYING_LABEL = "Lying"         # post-fall / person-down state
+CLASS_NAMES_PATH = "class_names.txt"
+FALL_LABEL = "Fall"        # must match the class name used in class_names.txt exactly
 VIDEO_SAMPLE_EVERY_N_FRAMES = 15  # classify roughly ~2 frames/sec at 30fps video
-
-# Standard 33-point BlazePose skeleton connections (stable across versions)
-POSE_CONNECTIONS = [
-    (0, 1), (1, 2), (2, 3), (3, 7), (0, 4), (4, 5), (5, 6), (6, 8),
-    (9, 10), (11, 12), (11, 13), (13, 15), (15, 17), (15, 19), (15, 21), (17, 19),
-    (12, 14), (14, 16), (16, 18), (16, 20), (16, 22), (18, 20),
-    (11, 23), (12, 24), (23, 24), (23, 25), (24, 26), (25, 27), (26, 28),
-    (27, 29), (28, 30), (29, 31), (30, 32), (27, 31), (28, 32),
-]
 
 st.set_page_config(page_title="Elderly Fall Detection", page_icon="🚨", layout="centered")
 
@@ -102,7 +85,6 @@ def load_pose_detector():
 # ----------------------------------------------------------------------
 def init_session_state():
     if "history" not in st.session_state:
-        # each entry: {"label": str, "confidence": float, "source": str, "timestamp": float}
         st.session_state.history = []
 
 
@@ -138,6 +120,7 @@ def classify_array(model, class_names, rgb_array: np.ndarray):
     prob_dict = {name: float(p) for name, p in zip(class_names, probs)}
     return label, prob_dict
 
+
 def draw_pose_on_array(pose_model, bgr_image):
     if pose_model is None:
         return bgr_image, False
@@ -157,11 +140,6 @@ def show_fall_alert(label: str, confidence: float):
             f"🚨 **EMERGENCY ALERT — FALL IN PROGRESS** 🚨\n\n"
             f"Confidence: {confidence:.1%}. Notify caregiver / emergency contact immediately."
         )
-    elif label == LYING_LABEL:
-        st.warning(
-            f"⚠️ **Person appears to be lying down** — possible post-fall state.\n\n"
-            f"Confidence: {confidence:.1%}. Check on them if this is unexpected."
-        )
     else:
         st.success(f"✅ Normal activity detected: **{label}** ({confidence:.1%} confidence)")
 
@@ -177,14 +155,12 @@ def render_session_analytics():
 
     total = len(history)
     fall_count = sum(1 for h in history if h["label"] == FALL_LABEL)
-    lying_count = sum(1 for h in history if h["label"] == LYING_LABEL)
-    normal_count = sum(1 for h in history if h["label"] not in (FALL_LABEL, LYING_LABEL))
+    non_fall_count = total - fall_count
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     c1.metric("Total activities detected", total)
     c2.metric("Fall events", fall_count)
-    c3.metric("Lying events", lying_count)
-    c4.metric("Normal activity count", normal_count)
+    c3.metric("Non-fall activities", non_fall_count)
 
     counts = Counter(h["label"] for h in history)
     dist_df = pd.DataFrame({"Activity": list(counts.keys()), "Count": list(counts.values())})
@@ -264,7 +240,7 @@ with st.sidebar:
     show_probs = st.checkbox("Show class probabilities", value=True)
     st.markdown("---")
     st.caption(
-        "Model expects: fall_detection_model.h5 and class_names.txt "
+        "Model expects: fall_detection_model.tflite and class_names.txt "
         "in the app folder (from the training notebook)."
     )
 
@@ -352,7 +328,6 @@ with tab_video:
     if video_file is not None:
         st.video(video_file)
         if st.button("▶️ Run analysis on this video"):
-            # Write to a temp file since OpenCV needs a filesystem path
             temp_path = os.path.join("temp_uploaded_video." + video_file.name.split(".")[-1])
             with open(temp_path, "wb") as f:
                 f.write(video_file.getbuffer())
