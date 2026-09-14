@@ -6,15 +6,6 @@ Loads the CNN trained in the companion Colab notebook
 upload an image, take a photo, or upload a video to classify activity
 into one of 5 classes: Fall, Normal, Sitting, Standing, Walking.
 
-Covers FA-2 Step 7 requirements:
-- Upload images
-- Upload videos
-- Run AI predictions
-- Display fall alerts (emergency notification)
-- Show monitoring analytics (totals, fall count, normal count,
-  confidence score, activity distribution chart)
-- Pose visualization overlay (MediaPipe)
-
 Run with:
     streamlit run app.py
 
@@ -25,18 +16,19 @@ Expected files in the same folder as this script:
 
 import os
 import time
+import urllib.request
 from collections import Counter
 
 import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
-import tflite_runtime.interpreter as tflite
+import tensorflow as tf
 from PIL import Image
 
 import mediapipe as mp
-mp_pose = mp.solutions.pose
-mp_drawing = mp.solutions.drawing_utils
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
 
 # ----------------------------------------------------------------------
 # Config
@@ -46,6 +38,20 @@ MODEL_PATH = "fall_detection_model.tflite"
 CLASS_NAMES_PATH = "class_names.txt"
 FALL_LABEL = "Fall"        # must match the class name used in class_names.txt exactly
 VIDEO_SAMPLE_EVERY_N_FRAMES = 15  # classify roughly ~2 frames/sec at 30fps video
+
+POSE_MODEL_PATH = "pose_landmarker.task"
+POSE_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+    "pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
+)
+# Standard 33-point BlazePose skeleton connections (stable across versions)
+POSE_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 7), (0, 4), (4, 5), (5, 6), (6, 8),
+    (9, 10), (11, 12), (11, 13), (13, 15), (15, 17), (15, 19), (15, 21), (17, 19),
+    (12, 14), (14, 16), (16, 18), (16, 20), (16, 22), (18, 20),
+    (11, 23), (12, 24), (23, 24), (23, 25), (24, 26), (25, 27), (26, 28),
+    (27, 29), (28, 30), (29, 31), (30, 32), (27, 31), (28, 32),
+]
 
 st.set_page_config(page_title="Elderly Fall Detection", page_icon="🚨", layout="centered")
 
@@ -61,7 +67,7 @@ def load_model():
             "(it's produced by the training notebook)."
         )
         st.stop()
-    interpreter = tflite.Interpreter(model_path=MODEL_PATH)
+    interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
     interpreter.allocate_tensors()
     return interpreter
 
@@ -77,7 +83,11 @@ def load_class_names():
 
 @st.cache_resource(show_spinner="Loading pose model...")
 def load_pose_detector():
-    return mp_pose.Pose(static_image_mode=True, model_complexity=1, min_detection_confidence=0.5)
+    if not os.path.exists(POSE_MODEL_PATH):
+        urllib.request.urlretrieve(POSE_MODEL_URL, POSE_MODEL_PATH)
+    base_options = mp_python.BaseOptions(model_asset_path=POSE_MODEL_PATH)
+    options = vision.PoseLandmarkerOptions(base_options=base_options)
+    return vision.PoseLandmarker.create_from_options(options)
 
 
 # ----------------------------------------------------------------------
@@ -116,20 +126,40 @@ def classify_array(model, class_names, rgb_array: np.ndarray):
     probs = interpreter.get_tensor(output_details[0]['index'])[0]
 
     pred_idx = int(np.argmax(probs))
+    if pred_idx >= len(class_names):
+        st.error(
+            f"Model predicts {len(probs)} classes but class_names.txt only has "
+            f"{len(class_names)} entries. Re-export fall_detection_model.tflite "
+            "from your 5-class training run and re-upload class_names.txt."
+        )
+        st.stop()
     label = class_names[pred_idx]
     prob_dict = {name: float(p) for name, p in zip(class_names, probs)}
     return label, prob_dict
 
 
-def draw_pose_on_array(pose_model, bgr_image):
-    if pose_model is None:
+def draw_pose_on_array(pose_detector, bgr_image):
+    if pose_detector is None:
         return bgr_image, False
+
     rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
-    results = pose_model.process(rgb)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    result = pose_detector.detect(mp_image)
+
     annotated = bgr_image.copy()
-    if not results.pose_landmarks:
+    if not result.pose_landmarks:
         return annotated, False
-    mp_drawing.draw_landmarks(annotated, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+
+    h, w, _ = annotated.shape
+    landmarks = result.pose_landmarks[0]  # first detected person
+    points = []
+    for lm in landmarks:
+        x, y = int(lm.x * w), int(lm.y * h)
+        points.append((x, y))
+        cv2.circle(annotated, (x, y), 4, (0, 255, 0), -1)
+    for start_idx, end_idx in POSE_CONNECTIONS:
+        cv2.line(annotated, points[start_idx], points[end_idx], (255, 0, 0), 2)
+
     return annotated, True
 
 
@@ -142,6 +172,7 @@ def show_fall_alert(label: str, confidence: float):
         )
     else:
         st.success(f"✅ Activity detected: **{label}** ({confidence:.1%} confidence)")
+
 
 def render_session_analytics():
     """Monitoring analytics panel: totals, fall count, normal count, distribution chart."""
