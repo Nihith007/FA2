@@ -1,3 +1,8 @@
 libgl1
 libglib2.0-0
 libegl1
+libgles2
+libglu1-mesa
+libsm6
+libxext6
+libxrender1
