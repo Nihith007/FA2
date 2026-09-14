@@ -78,7 +78,9 @@ def load_model():
             "(it's produced by the training notebook)."
         )
         st.stop()
-    return tf.keras.models.load_model(MODEL_PATH)
+    interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
+    interpreter.allocate_tensors()
+    return interpreter
 
 
 @st.cache_resource(show_spinner=False)
@@ -126,12 +128,19 @@ def reset_session():
 # Core logic
 # ----------------------------------------------------------------------
 def classify_array(model, class_names, rgb_array: np.ndarray):
-    """Resize/normalize an RGB numpy image and run the CNN. Returns (label, probs dict)."""
+    """Resize/normalize an RGB numpy image and run the TFLite model."""
+    interpreter = model
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+
     img = Image.fromarray(rgb_array).convert("RGB").resize(IMG_SIZE)
     arr = np.array(img).astype("float32") / 255.0
-    arr = np.expand_dims(arr, axis=0)  # batch dim
+    arr = np.expand_dims(arr, axis=0)
 
-    probs = model.predict(arr, verbose=0)[0]
+    interpreter.set_tensor(input_details[0]['index'], arr)
+    interpreter.invoke()
+    probs = interpreter.get_tensor(output_details[0]['index'])[0]
+
     pred_idx = int(np.argmax(probs))
     label = class_names[pred_idx]
     prob_dict = {name: float(p) for name, p in zip(class_names, probs)}
