@@ -78,7 +78,7 @@ def load_model():
             "(it's produced by the training notebook)."
         )
         st.stop()
-    interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
+    interpreter = tflite.Interpreter(model_path=MODEL_PATH)
     interpreter.allocate_tensors()
     return interpreter
 
