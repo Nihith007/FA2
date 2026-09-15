@@ -5,9 +5,4 @@ numpy==1.26.4
 pandas>=2.1.0
 Pillow>=10.0.0
 mediapipe==0.10.9
-matplotlib
-seaborn
-scikit-learn
-split-folders
-tensorflow
-
+matplotlib>=3.7.0
