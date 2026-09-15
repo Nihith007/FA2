@@ -140,6 +140,30 @@ def is_git_lfs_pointer(path: str) -> bool:
         return False
 
 
+def looks_like_valid_hdf5(path: str) -> bool:
+    """Check the real HDF5 magic bytes, not just file size — catches a file
+    that 'exists' and isn't an LFS pointer but is still corrupted (e.g. Git
+    line-ending normalization mangled a binary file that wasn't marked as
+    binary via .gitattributes)."""
+    try:
+        with open(path, "rb") as f:
+            sig = f.read(8)
+        return sig == b"\x89HDF\r\n\x1a\n"
+    except OSError:
+        return False
+
+
+def looks_like_valid_tflite(path: str) -> bool:
+    """TFLite files are FlatBuffers with a 'TFL3' identifier at byte offset 4."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(4)
+            ident = f.read(4)
+        return ident == b"TFL3"
+    except OSError:
+        return False
+
+
 def ensure_file(path: str, url: str, friendly_name: str, silent: bool = False) -> bool:
     """Make sure `path` exists and is a real file (not an LFS pointer).
     Tries to download it from `url` if missing/broken and a URL was given.
@@ -222,20 +246,52 @@ def load_model():
     """Returns a small bundle dict: {"type": "tflite"|"keras", "model": ...}.
     Prefers a TFLite model (smaller, faster); falls back to loading the raw
     Keras .h5 model directly if no .tflite conversion was ever committed.
+    Validates real file signatures (not just presence/size) so a corrupted
+    binary — the classic case being a .h5/.tflite committed without a
+    .gitattributes marking it as binary, so Git's line-ending normalization
+    silently rewrote bytes inside it — gets a clear diagnostic instead of a
+    raw OSError from deep inside TensorFlow/h5py.
     """
+    corruption_hint = (
+        "This usually means the binary got corrupted in Git — most commonly because "
+        "there's no `.gitattributes` marking the file as binary, so Git's line-ending "
+        "normalization rewrote bytes inside it. Fix: add a `.gitattributes` file to the "
+        "repo containing:\n\n    *.h5 -text\n    *.tflite -text\n\n"
+        "then re-add and re-commit the model file(s) from a fresh export (you may need "
+        "`git rm --cached <file>` first, since the corrupted version is already in git "
+        "history) and push again."
+    )
+
     if ensure_file(MODEL_PATH, MODEL_URL, "TFLite model file", silent=True):
-        interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
-        interpreter.allocate_tensors()
-        return {"type": "tflite", "model": interpreter}
+        if not looks_like_valid_tflite(MODEL_PATH):
+            st.warning(f"'{MODEL_PATH}' was found but doesn't look like a valid TFLite file "
+                       f"(missing the TFL3 header). {corruption_hint}\n\nFalling back to "
+                       f"'{H5_MODEL_PATH}' for now.")
+        else:
+            try:
+                interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
+                interpreter.allocate_tensors()
+                return {"type": "tflite", "model": interpreter}
+            except Exception as e:
+                st.warning(f"Found '{MODEL_PATH}' but couldn't load it ({e}). "
+                           f"Falling back to '{H5_MODEL_PATH}'.")
 
     if ensure_file(H5_MODEL_PATH, H5_MODEL_URL, "Keras (.h5) model file"):
+        if not looks_like_valid_hdf5(H5_MODEL_PATH):
+            st.error(f"'{H5_MODEL_PATH}' was found but isn't a valid HDF5 file (wrong file "
+                     f"signature). {corruption_hint}")
+            st.stop()
         st.info(
-            f"No '{MODEL_PATH}' found — loading '{H5_MODEL_PATH}' instead. This works fine, "
-            "but a TFLite conversion (from your training notebook) loads faster in Streamlit. "
-            "Not required, just an optional speed-up."
+            f"No usable '{MODEL_PATH}' found — loading '{H5_MODEL_PATH}' instead. This works "
+            "fine, but a valid TFLite conversion loads faster in Streamlit (optional speed-up)."
         )
-        keras_model = tf.keras.models.load_model(H5_MODEL_PATH)
-        return {"type": "keras", "model": keras_model}
+        try:
+            keras_model = tf.keras.models.load_model(H5_MODEL_PATH)
+            return {"type": "keras", "model": keras_model}
+        except Exception as e:
+            st.error(f"Found a valid-looking '{H5_MODEL_PATH}' but Keras still couldn't load "
+                     f"it: {e}")
+            st.stop()
 
     st.stop()
 
