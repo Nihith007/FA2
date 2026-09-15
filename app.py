@@ -74,6 +74,7 @@ from mediapipe.tasks.python import vision
 # ----------------------------------------------------------------------
 IMG_SIZE = (128, 128)
 MODEL_PATH = "fall_detection_model.tflite"
+H5_MODEL_PATH = "fall_detection_model.h5"  # fallback if the TFLite conversion step wasn't run
 CLASS_NAMES_PATH = "class_names.txt"
 # If the model isn't found next to app.py (e.g. it's too big for a normal git
 # push, or Git LFS wasn't pulled), the app will try to download it from here.
@@ -82,6 +83,7 @@ CLASS_NAMES_PATH = "class_names.txt"
 # works well for files over ~50MB; raw.githubusercontent.com works for
 # smaller files committed normally (not via LFS).
 MODEL_URL = ""       # e.g. "https://github.com/you/repo/releases/download/v1/fall_detection_model.tflite"
+H5_MODEL_URL = ""    # same idea, for the .h5 fallback
 CLASS_NAMES_URL = ""  # optional, same idea for class_names.txt
 FALL_LABEL = "Fall"        # must match the class name used in class_names.txt exactly
 WALKING_LABEL = "Walking"  # must match the class name used in class_names.txt exactly
@@ -138,12 +140,15 @@ def is_git_lfs_pointer(path: str) -> bool:
         return False
 
 
-def ensure_file(path: str, url: str, friendly_name: str) -> bool:
+def ensure_file(path: str, url: str, friendly_name: str, silent: bool = False) -> bool:
     """Make sure `path` exists and is a real file (not an LFS pointer).
     Tries to download it from `url` if missing/broken and a URL was given.
     Shows a detailed diagnostic (cwd contents, LFS hint) instead of just
-    'not found' when it still can't locate a usable file. Returns True if a
-    usable file is available at `path` afterwards.
+    'not found' when it still can't locate a usable file — unless `silent`
+    is True, which is used for optional/fallback attempts where a failure
+    here isn't necessarily an error (e.g. trying TFLite before falling back
+    to a Keras .h5 model). Returns True if a usable file is available at
+    `path` afterwards.
     """
     needs_download = not os.path.exists(path) or is_git_lfs_pointer(path)
 
@@ -153,10 +158,13 @@ def ensure_file(path: str, url: str, friendly_name: str) -> bool:
                 urllib.request.urlretrieve(url, path)
             needs_download = not os.path.exists(path) or is_git_lfs_pointer(path)
         except Exception as e:
-            st.error(f"Failed to download {friendly_name} from {url}: {e}")
+            if not silent:
+                st.error(f"Failed to download {friendly_name} from {url}: {e}")
             return False
 
     if needs_download:
+        if silent:
+            return False
         cwd = os.getcwd()
         try:
             nearby_files = os.listdir(cwd)
@@ -211,11 +219,25 @@ def resolve_class_label(class_names, expected_label):
 # ----------------------------------------------------------------------
 @st.cache_resource(show_spinner="Loading classification model...")
 def load_model():
-    if not ensure_file(MODEL_PATH, MODEL_URL, "model file (fall_detection_model.tflite)"):
-        st.stop()
-    interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
-    interpreter.allocate_tensors()
-    return interpreter
+    """Returns a small bundle dict: {"type": "tflite"|"keras", "model": ...}.
+    Prefers a TFLite model (smaller, faster); falls back to loading the raw
+    Keras .h5 model directly if no .tflite conversion was ever committed.
+    """
+    if ensure_file(MODEL_PATH, MODEL_URL, "TFLite model file", silent=True):
+        interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
+        interpreter.allocate_tensors()
+        return {"type": "tflite", "model": interpreter}
+
+    if ensure_file(H5_MODEL_PATH, H5_MODEL_URL, "Keras (.h5) model file"):
+        st.info(
+            f"No '{MODEL_PATH}' found — loading '{H5_MODEL_PATH}' instead. This works fine, "
+            "but a TFLite conversion (from your training notebook) loads faster in Streamlit. "
+            "Not required, just an optional speed-up."
+        )
+        keras_model = tf.keras.models.load_model(H5_MODEL_PATH)
+        return {"type": "keras", "model": keras_model}
+
+    st.stop()
 
 
 @st.cache_resource(show_spinner=False)
@@ -288,19 +310,23 @@ def reset_session():
 # ----------------------------------------------------------------------
 # Core logic
 # ----------------------------------------------------------------------
-def classify_array(model, class_names, rgb_array: np.ndarray):
-    """Resize/normalize an RGB numpy image and run the TFLite model."""
-    interpreter = model
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
-
+def classify_array(model_bundle, class_names, rgb_array: np.ndarray):
+    """Resize/normalize an RGB numpy image and run the classifier, whether
+    it's a TFLite interpreter or a raw Keras model."""
     img = Image.fromarray(rgb_array).convert("RGB").resize(IMG_SIZE)
     arr = np.array(img).astype("float32") / 255.0
     arr = np.expand_dims(arr, axis=0)
 
-    interpreter.set_tensor(input_details[0]['index'], arr)
-    interpreter.invoke()
-    probs = interpreter.get_tensor(output_details[0]['index'])[0]
+    if model_bundle["type"] == "tflite":
+        interpreter = model_bundle["model"]
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+        interpreter.set_tensor(input_details[0]['index'], arr)
+        interpreter.invoke()
+        probs = interpreter.get_tensor(output_details[0]['index'])[0]
+    else:  # "keras"
+        keras_model = model_bundle["model"]
+        probs = keras_model.predict(arr, verbose=0)[0]
 
     pred_idx = int(np.argmax(probs))
     if pred_idx >= len(class_names):
