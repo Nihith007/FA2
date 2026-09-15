@@ -75,6 +75,14 @@ from mediapipe.tasks.python import vision
 IMG_SIZE = (128, 128)
 MODEL_PATH = "fall_detection_model.tflite"
 CLASS_NAMES_PATH = "class_names.txt"
+# If the model isn't found next to app.py (e.g. it's too big for a normal git
+# push, or Git LFS wasn't pulled), the app will try to download it from here.
+# Use a direct-download link: a GitHub "Release" asset URL
+# (https://github.com/<user>/<repo>/releases/download/<tag>/<file>.tflite)
+# works well for files over ~50MB; raw.githubusercontent.com works for
+# smaller files committed normally (not via LFS).
+MODEL_URL = ""       # e.g. "https://github.com/you/repo/releases/download/v1/fall_detection_model.tflite"
+CLASS_NAMES_URL = ""  # optional, same idea for class_names.txt
 FALL_LABEL = "Fall"        # must match the class name used in class_names.txt exactly
 WALKING_LABEL = "Walking"  # must match the class name used in class_names.txt exactly
 VIDEO_SAMPLE_EVERY_N_FRAMES = 15  # classify roughly ~2 frames/sec at 30fps video
@@ -116,6 +124,69 @@ OCCLUSION_OPTIONS = ["Not specified", "None", "Partial (furniture / limbs)",
 st.set_page_config(page_title="Elderly Fall Detection", page_icon="🚨", layout="centered")
 
 
+def is_git_lfs_pointer(path: str) -> bool:
+    """Detect the classic failure mode: the file 'exists' but is actually a
+    tiny Git LFS pointer (plain text) instead of the real binary, because LFS
+    objects weren't pulled during clone/deploy."""
+    try:
+        if os.path.getsize(path) > 2000:
+            return False
+        with open(path, "rb") as f:
+            head = f.read(200)
+        return head.startswith(b"version https://git-lfs.github.com/spec")
+    except OSError:
+        return False
+
+
+def ensure_file(path: str, url: str, friendly_name: str) -> bool:
+    """Make sure `path` exists and is a real file (not an LFS pointer).
+    Tries to download it from `url` if missing/broken and a URL was given.
+    Shows a detailed diagnostic (cwd contents, LFS hint) instead of just
+    'not found' when it still can't locate a usable file. Returns True if a
+    usable file is available at `path` afterwards.
+    """
+    needs_download = not os.path.exists(path) or is_git_lfs_pointer(path)
+
+    if needs_download and url:
+        try:
+            with st.spinner(f"Downloading {friendly_name} from {url} ..."):
+                urllib.request.urlretrieve(url, path)
+            needs_download = not os.path.exists(path) or is_git_lfs_pointer(path)
+        except Exception as e:
+            st.error(f"Failed to download {friendly_name} from {url}: {e}")
+            return False
+
+    if needs_download:
+        cwd = os.getcwd()
+        try:
+            nearby_files = os.listdir(cwd)
+        except OSError:
+            nearby_files = []
+        if os.path.exists(path) and is_git_lfs_pointer(path):
+            st.error(
+                f"⚠️ '{path}' exists but is only a Git LFS pointer file, not the real "
+                f"{friendly_name}. This happens when Git LFS objects weren't pulled during "
+                "deploy/clone. Fix by either: (1) running `git lfs pull` where you deployed "
+                "from, (2) enabling Git LFS support on your hosting platform, or "
+                f"(3) setting MODEL_URL / CLASS_NAMES_URL in app.py to a direct download link "
+                "(e.g. a GitHub Release asset) so the app fetches the real file itself."
+            )
+        else:
+            st.error(
+                f"'{path}' not found. The app is currently running from: `{cwd}`, which "
+                f"contains: {nearby_files if nearby_files else '(nothing readable)'}. "
+                f"If {friendly_name} is committed to GitHub but not showing up here, check: "
+                "the file is actually in this exact folder (not a subfolder) relative to "
+                "where app.py runs, it's under GitHub's ~100MB limit or handled via Git LFS "
+                "(and LFS was pulled), and it isn't excluded by .gitignore. Alternatively, set "
+                "MODEL_URL / CLASS_NAMES_URL near the top of app.py to a direct download link "
+                "and the app will fetch it automatically."
+            )
+        return False
+
+    return True
+
+
 def resolve_class_label(class_names, expected_label):
     """Match `expected_label` against class_names.txt case-insensitively.
 
@@ -140,11 +211,7 @@ def resolve_class_label(class_names, expected_label):
 # ----------------------------------------------------------------------
 @st.cache_resource(show_spinner="Loading classification model...")
 def load_model():
-    if not os.path.exists(MODEL_PATH):
-        st.error(
-            f"Model file '{MODEL_PATH}' not found. Place it next to app.py "
-            "(it's produced by the training notebook)."
-        )
+    if not ensure_file(MODEL_PATH, MODEL_URL, "model file (fall_detection_model.tflite)"):
         st.stop()
     interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
     interpreter.allocate_tensors()
@@ -153,8 +220,7 @@ def load_model():
 
 @st.cache_resource(show_spinner=False)
 def load_class_names():
-    if not os.path.exists(CLASS_NAMES_PATH):
-        st.error(f"'{CLASS_NAMES_PATH}' not found. Place it next to app.py.")
+    if not ensure_file(CLASS_NAMES_PATH, CLASS_NAMES_URL, "class_names.txt"):
         st.stop()
     with open(CLASS_NAMES_PATH, "r") as f:
         return [line.strip() for line in f if line.strip()]
