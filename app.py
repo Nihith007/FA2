@@ -23,10 +23,24 @@ NEW IN THIS VERSION
 - Environmental-factor analysis: false-alarm & accuracy rate broken down by
   Lighting, Camera angle and Occlusion tag, so you can see which conditions
   actually hurt the model in practice.
-- Model Training Performance section: upload the accuracy/loss history you
-  exported from the Colab notebook (history.history) as JSON or CSV to plot
-  Accuracy and Loss curves. This app never re-trains anything itself — it
-  only visualizes numbers you already computed in the notebook.
+- Diagnostic flags for two specific problems observed in testing:
+    1) Falls being classified as Sitting: a MediaPipe pose heuristic
+       estimates whether the body is lying horizontal vs upright. If the
+       body looks horizontal but the CNN did NOT say "Fall", the app raises
+       a caution ("pose says lying down, model said <label> — verify") and
+       logs it, so you can see how often this happens.
+    2) Walking never being detected: for video, the app compares consecutive
+       sampled frames for motion. If real motion is present but the CNN
+       predicts a static class (not Walking, not Fall), it's flagged as a
+       possible missed-Walking case.
+  These are runtime heuristics to help you SEE the problem and collect
+  evidence — they cannot fix the underlying CNN. The real fix is retraining
+  with more/varied "Fall" examples that look like sitting-on-floor poses,
+  and more "Walking" clips across different angles/speeds/lighting.
+- Class-name auto-check: on startup the app verifies that "Fall" and
+  "Walking" actually exist in class_names.txt (case-insensitively) and warns
+  you if the casing/spelling differs from what the app expects, since a
+  mismatch there would silently stop alerts from ever firing.
 
 Run with:
     streamlit run app.py
@@ -34,21 +48,10 @@ Run with:
 Expected files in the same folder as this script:
     fall_detection_model.tflite
     class_names.txt
-
-To get an Accuracy/Loss graph, export your Keras History object from the
-training notebook, e.g.:
-
-    import json
-    with open("training_history.json", "w") as f:
-        json.dump(history.history, f)
-
-...then upload training_history.json in the "Model Training Performance"
-section of this app.
 """
 
 import io
 import itertools
-import json
 import os
 import time
 import urllib.request
@@ -73,8 +76,17 @@ IMG_SIZE = (128, 128)
 MODEL_PATH = "fall_detection_model.tflite"
 CLASS_NAMES_PATH = "class_names.txt"
 FALL_LABEL = "Fall"        # must match the class name used in class_names.txt exactly
+WALKING_LABEL = "Walking"  # must match the class name used in class_names.txt exactly
 VIDEO_SAMPLE_EVERY_N_FRAMES = 15  # classify roughly ~2 frames/sec at 30fps video
 THUMB_MAX_DIM = 220         # size of stored screenshot thumbnails
+
+# --- Diagnostic heuristic thresholds (tune these against your own footage) ---
+# Angle (degrees) from vertical, based on shoulder-to-hip line, above which the
+# body is considered "lying horizontal" — used to flag Fall-vs-Sitting confusion.
+HORIZONTAL_ANGLE_THRESHOLD = 55
+# Mean absolute pixel difference between consecutive sampled frames above which
+# we consider "real motion" present — used to flag missed Walking detections.
+MOTION_SCORE_THRESHOLD = 10
 
 POSE_MODEL_PATH = "pose_landmarker.task"
 POSE_MODEL_URL = (
@@ -102,6 +114,25 @@ OCCLUSION_OPTIONS = ["Not specified", "None", "Partial (furniture / limbs)",
                       "Heavy occlusion"]
 
 st.set_page_config(page_title="Elderly Fall Detection", page_icon="🚨", layout="centered")
+
+
+def resolve_class_label(class_names, expected_label):
+    """Match `expected_label` against class_names.txt case-insensitively.
+
+    Returns the exact string used in class_names.txt, or `expected_label`
+    unchanged if no match was found at all (with a warning shown to the user).
+    A mismatch here (e.g. file has 'fall' but the app expects 'Fall') would
+    otherwise silently prevent alerts from ever firing.
+    """
+    for name in class_names:
+        if name.strip().lower() == expected_label.strip().lower():
+            return name
+    st.warning(
+        f"⚠️ Couldn't find a class named '{expected_label}' (case-insensitive) in "
+        f"class_names.txt. Found: {class_names}. Alerts/flags tied to "
+        f"'{expected_label}' will not work until this is fixed."
+    )
+    return expected_label
 
 
 # ----------------------------------------------------------------------
@@ -144,8 +175,6 @@ def load_pose_detector():
 def init_session_state():
     if "history" not in st.session_state:
         st.session_state.history = []
-    if "training_history" not in st.session_state:
-        st.session_state.training_history = None
     if "last_alert" not in st.session_state:
         st.session_state.last_alert = None
 
@@ -159,8 +188,14 @@ def array_to_thumb_bytes(rgb_array: np.ndarray, max_dim: int = THUMB_MAX_DIM) ->
     return buf.getvalue()
 
 
-def log_prediction(label: str, confidence: float, source: str, thumb: bytes = None):
-    """Append a new prediction to the running history / evaluation log."""
+def log_prediction(label: str, confidence: float, source: str, thumb: bytes = None,
+                    pose_flag: bool = False, motion_flag: bool = False, pose_angle=None):
+    """Append a new prediction to the running history / evaluation log.
+
+    pose_flag / motion_flag are runtime diagnostic hints (not ground truth):
+    pose_flag  = pose orientation looked horizontal/lying but label wasn't Fall
+    motion_flag = real motion was detected between frames but label wasn't Walking/Fall
+    """
     entry = {
         "label": label,               # what the model predicted
         "confidence": confidence,
@@ -171,6 +206,9 @@ def log_prediction(label: str, confidence: float, source: str, thumb: bytes = No
         "camera_angle": "Not specified",
         "occlusion": "Not specified",
         "thumb": thumb,
+        "pose_flag": bool(pose_flag),
+        "motion_flag": bool(motion_flag),
+        "pose_angle": pose_angle,
     }
     st.session_state.history.append(entry)
     st.session_state.last_alert = entry
@@ -212,8 +250,11 @@ def classify_array(model, class_names, rgb_array: np.ndarray):
 
 
 def draw_pose_on_array(pose_detector, bgr_image):
+    """Detect + draw the pose skeleton. Also returns the raw normalized
+    landmarks (or None) so callers can run the orientation heuristic without
+    re-running pose detection a second time."""
     if pose_detector is None:
-        return bgr_image, False
+        return bgr_image, False, None
 
     rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -221,7 +262,7 @@ def draw_pose_on_array(pose_detector, bgr_image):
 
     annotated = bgr_image.copy()
     if not result.pose_landmarks:
-        return annotated, False
+        return annotated, False, None
 
     h, w, _ = annotated.shape
     landmarks = result.pose_landmarks[0]  # first detected person
@@ -233,7 +274,33 @@ def draw_pose_on_array(pose_detector, bgr_image):
     for start_idx, end_idx in POSE_CONNECTIONS:
         cv2.line(annotated, points[start_idx], points[end_idx], (255, 0, 0), 2)
 
-    return annotated, True
+    return annotated, True, landmarks
+
+
+def estimate_body_orientation(landmarks):
+    """Rough "standing vs lying down" signal from the shoulder->hip line.
+
+    Uses BlazePose indices: 11/12 = left/right shoulder, 23/24 = left/right hip.
+    Returns the angle in degrees between that line and the vertical axis
+    (0 = perfectly upright, 90 = perfectly horizontal/lying), or None if the
+    needed landmarks aren't available.
+    """
+    if not landmarks or len(landmarks) < 25:
+        return None
+    try:
+        sx = (landmarks[11].x + landmarks[12].x) / 2.0
+        sy = (landmarks[11].y + landmarks[12].y) / 2.0
+        hx = (landmarks[23].x + landmarks[24].x) / 2.0
+        hy = (landmarks[23].y + landmarks[24].y) / 2.0
+    except (IndexError, AttributeError):
+        return None
+
+    dx = abs(hx - sx)
+    dy = abs(hy - sy)
+    if dx == 0 and dy == 0:
+        return None
+    angle = np.degrees(np.arctan2(dx, dy + 1e-6))
+    return float(angle)
 
 
 def show_fall_alert(label: str, confidence: float):
@@ -536,55 +603,66 @@ def render_session_analytics(class_names):
 
 
 # ----------------------------------------------------------------------
-# Model training performance (accuracy / loss curves from the notebook)
+# Diagnostic flags: Fall-as-Sitting confusion & missed Walking detections
 # ----------------------------------------------------------------------
-def render_training_performance():
-    st.subheader("🧪 Model Training Performance")
+def render_diagnostic_flags():
+    st.subheader("🩺 Model Diagnostic Flags")
     st.caption(
-        "Upload the training history exported from the Colab notebook "
-        "(JSON from `history.history`, or a CSV with accuracy/val_accuracy/loss/val_loss "
-        "columns) to view the Accuracy and Loss curves used to validate the model."
+        "These are runtime heuristics — not ground truth — meant to help you SEE "
+        "and collect evidence for two known problems, since neither can be fixed "
+        "by this app alone (both trace back to the CNN's training data)."
     )
-
-    uploaded = st.file_uploader(
-        "Upload training_history.json or .csv", type=["json", "csv"], key="history_uploader"
-    )
-    if uploaded is not None:
-        try:
-            if uploaded.name.endswith(".json"):
-                hist = json.load(uploaded)
-            else:
-                hist_df = pd.read_csv(uploaded)
-                hist = {col: hist_df[col].tolist() for col in hist_df.columns}
-            st.session_state.training_history = hist
-        except Exception as e:
-            st.error(f"Could not parse the uploaded file: {e}")
-
-    hist = st.session_state.training_history
-    if not hist:
-        st.caption("No training history loaded yet.")
+    history = st.session_state.history
+    if not history:
+        st.caption("No activity recorded yet this session.")
         return
 
-    acc_keys = [k for k in hist if "acc" in k.lower()]
-    loss_keys = [k for k in hist if "loss" in k.lower()]
+    pose_flagged = [h for h in history if h.get("pose_flag")]
+    motion_flagged = [h for h in history if h.get("motion_flag")]
 
-    if acc_keys:
-        st.markdown("**Accuracy Graph**")
-        acc_df = pd.DataFrame({k: hist[k] for k in acc_keys})
-        acc_df.index.name = "Epoch"
-        st.line_chart(acc_df)
+    c1, c2 = st.columns(2)
+    c1.metric("⚠️ Possible Fall→Sitting confusion", len(pose_flagged))
+    c2.metric("⚠️ Possible missed Walking", len(motion_flagged))
 
-    if loss_keys:
-        st.markdown("**Loss Graph**")
-        loss_df = pd.DataFrame({k: hist[k] for k in loss_keys})
-        loss_df.index.name = "Epoch"
-        st.line_chart(loss_df)
+    if pose_flagged:
+        with st.expander(f"Frames flagged as horizontal-but-not-Fall ({len(pose_flagged)})"):
+            for h in pose_flagged[-10:]:
+                cols = st.columns([1, 3])
+                if h.get("thumb"):
+                    cols[0].image(h["thumb"], use_container_width=True)
+                angle_txt = f"{h['pose_angle']:.0f}°" if h.get("pose_angle") is not None else "n/a"
+                cols[1].write(
+                    f"Predicted **{h['label']}** ({h['confidence']:.0%}) — "
+                    f"body angle from upright: {angle_txt}"
+                )
+            st.markdown(
+                "**Likely cause:** the CNN was probably trained on Fall images that mostly "
+                "look like a person already still/sprawled on the floor, while Sitting images "
+                "share a similar low, folded silhouette from this camera angle. "
+                "**To fix at the source:** add more Fall training images captured at the "
+                "moment of/just after falling (not only the resting position), across "
+                "multiple camera angles, and make sure Sitting examples include the same "
+                "camera angles so the two classes aren't separable by camera position alone."
+            )
 
-    if not acc_keys and not loss_keys:
-        st.warning(
-            "Uploaded file didn't contain any keys with 'acc' or 'loss' in the name — "
-            "check the export from the notebook."
-        )
+    if motion_flagged:
+        with st.expander(f"Frames flagged as motion-but-not-Walking ({len(motion_flagged)})"):
+            for h in motion_flagged[-10:]:
+                cols = st.columns([1, 3])
+                if h.get("thumb"):
+                    cols[0].image(h["thumb"], use_container_width=True)
+                cols[1].write(f"Predicted **{h['label']}** ({h['confidence']:.0%})")
+            st.markdown(
+                "**Likely cause:** the Walking class in training was probably limited in "
+                "camera angle, walking speed, or lighting compared to real usage. "
+                "**To fix at the source:** add Walking clips from the actual camera "
+                "position(s) this app will run with, at varied speeds and lighting, and "
+                "check `class_names.txt` / the model output layer to confirm Walking is "
+                "actually one of the trained classes (see the class-name check at startup)."
+            )
+
+    if not pose_flagged and not motion_flagged:
+        st.caption("No diagnostic flags raised yet for the current session's captures.")
 
 
 # ----------------------------------------------------------------------
@@ -604,6 +682,9 @@ def process_video(model, class_names, pose_detector, video_path: str, show_pose:
     processed = 0
     fall_frame_preview = None
     last_annotated_preview = None
+    prev_gray = None  # for motion detection between sampled frames
+    pose_flag_count = 0
+    motion_flag_count = 0
 
     while True:
         ret, frame_bgr = cap.read()
@@ -614,14 +695,32 @@ def process_video(model, class_names, pose_detector, video_path: str, show_pose:
             rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             label, probs = classify_array(model, class_names, rgb)
 
+            pose_angle = None
             if show_pose:
-                annotated_bgr, _ = draw_pose_on_array(pose_detector, frame_bgr)
+                annotated_bgr, _, landmarks = draw_pose_on_array(pose_detector, frame_bgr)
                 preview_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
+                pose_angle = estimate_body_orientation(landmarks)
             else:
                 preview_rgb = rgb
 
+            # Motion check: compare this sampled frame to the previous one
+            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (5, 5), 0)
+            motion_score = 0.0
+            if prev_gray is not None:
+                motion_score = float(cv2.absdiff(gray, prev_gray).mean())
+            prev_gray = gray
+
+            pose_flag = (pose_angle is not None and pose_angle > HORIZONTAL_ANGLE_THRESHOLD
+                         and label != FALL_LABEL)
+            motion_flag = (motion_score > MOTION_SCORE_THRESHOLD
+                           and label not in (WALKING_LABEL, FALL_LABEL))
+            pose_flag_count += int(pose_flag)
+            motion_flag_count += int(motion_flag)
+
             thumb = array_to_thumb_bytes(preview_rgb)
-            log_prediction(label, probs[label], source="video", thumb=thumb)
+            log_prediction(label, probs[label], source="video", thumb=thumb,
+                            pose_flag=pose_flag, motion_flag=motion_flag, pose_angle=pose_angle)
             processed += 1
             last_annotated_preview = preview_rgb
 
@@ -640,6 +739,17 @@ def process_video(model, class_names, pose_detector, video_path: str, show_pose:
         st.image(fall_frame_preview, caption="First detected fall frame", use_container_width=True)
     elif last_annotated_preview is not None:
         st.image(last_annotated_preview, caption="Last analyzed frame", use_container_width=True)
+
+    if pose_flag_count:
+        st.warning(
+            f"⚠️ {pose_flag_count} frame(s) had a horizontal/lying body orientation but "
+            f"weren't classified as Fall — possible Fall-as-Sitting confusion."
+        )
+    if motion_flag_count:
+        st.warning(
+            f"⚠️ {motion_flag_count} frame(s) showed real motion but weren't classified as "
+            f"Walking — possible missed Walking detections."
+        )
 
 
 # ----------------------------------------------------------------------
@@ -662,6 +772,8 @@ with st.sidebar:
 
 model = load_model()
 class_names = load_class_names()
+FALL_LABEL = resolve_class_label(class_names, FALL_LABEL)
+WALKING_LABEL = resolve_class_label(class_names, WALKING_LABEL)
 pose_detector = load_pose_detector() if show_pose else None
 
 # Real-time monitoring panel sits at the top so it's always visible
@@ -685,14 +797,20 @@ with tab_upload:
             label, probs = classify_array(model, class_names, rgb_arr)
 
         bgr = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2BGR)
+        pose_angle = None
         if show_pose:
-            annotated_bgr, person_found = draw_pose_on_array(pose_detector, bgr)
+            annotated_bgr, person_found, landmarks = draw_pose_on_array(pose_detector, bgr)
             display_img = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
+            pose_angle = estimate_body_orientation(landmarks)
         else:
             display_img = rgb_arr
             person_found = None
 
-        log_prediction(label, probs[label], source="image", thumb=array_to_thumb_bytes(display_img))
+        pose_flag = (pose_angle is not None and pose_angle > HORIZONTAL_ANGLE_THRESHOLD
+                     and label != FALL_LABEL)
+        log_prediction(label, probs[label], source="image",
+                        thumb=array_to_thumb_bytes(display_img),
+                        pose_flag=pose_flag, pose_angle=pose_angle)
 
         with col2:
             st.subheader("Result")
@@ -702,6 +820,12 @@ with tab_upload:
 
         st.markdown("---")
         show_fall_alert(label, probs[label])
+        if pose_flag:
+            st.warning(
+                f"⚠️ Body orientation looks horizontal (≈{pose_angle:.0f}° from upright) "
+                f"but the model predicted **{label}**, not Fall. This may be a Fall "
+                f"being confused with Sitting — please verify."
+            )
         if show_probs:
             st.bar_chart(probs)
 
@@ -720,14 +844,20 @@ with tab_camera:
             label, probs = classify_array(model, class_names, rgb_arr)
 
         bgr = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2BGR)
+        pose_angle = None
         if show_pose:
-            annotated_bgr, person_found = draw_pose_on_array(pose_detector, bgr)
+            annotated_bgr, person_found, landmarks = draw_pose_on_array(pose_detector, bgr)
             display_img = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
+            pose_angle = estimate_body_orientation(landmarks)
         else:
             display_img = rgb_arr
             person_found = None
 
-        log_prediction(label, probs[label], source="camera", thumb=array_to_thumb_bytes(display_img))
+        pose_flag = (pose_angle is not None and pose_angle > HORIZONTAL_ANGLE_THRESHOLD
+                     and label != FALL_LABEL)
+        log_prediction(label, probs[label], source="camera",
+                        thumb=array_to_thumb_bytes(display_img),
+                        pose_flag=pose_flag, pose_angle=pose_angle)
 
         with col2:
             st.subheader("Result")
@@ -737,6 +867,12 @@ with tab_camera:
 
         st.markdown("---")
         show_fall_alert(label, probs[label])
+        if pose_flag:
+            st.warning(
+                f"⚠️ Body orientation looks horizontal (≈{pose_angle:.0f}° from upright) "
+                f"but the model predicted **{label}**, not Fall. This may be a Fall "
+                f"being confused with Sitting — please verify."
+            )
         if show_probs:
             st.bar_chart(probs)
 
@@ -770,4 +906,4 @@ render_environment_analysis(class_names)
 st.markdown("---")
 render_screenshot_gallery()
 st.markdown("---")
-render_training_performance()
+render_diagnostic_flags()
