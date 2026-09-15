@@ -243,58 +243,24 @@ def resolve_class_label(class_names, expected_label):
 # ----------------------------------------------------------------------
 @st.cache_resource(show_spinner="Loading classification model...")
 def load_model():
-    """Returns a small bundle dict: {"type": "tflite"|"keras", "model": ...}.
-    Prefers a TFLite model (smaller, faster); falls back to loading the raw
-    Keras .h5 model directly if no .tflite conversion was ever committed.
-    Validates real file signatures (not just presence/size) so a corrupted
-    binary — the classic case being a .h5/.tflite committed without a
-    .gitattributes marking it as binary, so Git's line-ending normalization
-    silently rewrote bytes inside it — gets a clear diagnostic instead of a
-    raw OSError from deep inside TensorFlow/h5py.
-    """
     corruption_hint = (
         "This usually means the binary got corrupted in Git — most commonly because "
-        "there's no `.gitattributes` marking the file as binary, so Git's line-ending "
-        "normalization rewrote bytes inside it. Fix: add a `.gitattributes` file to the "
-        "repo root containing:\n"
-        "```\n*.h5 -text\n*.tflite -text\n```\n"
-        "then re-add and re-commit the model file(s) from a fresh export (you may need "
-        "`git rm --cached <file>` first, since the corrupted version is already in git "
-        "history) and push again."
+        "there's no `.gitattributes` marking the file as binary. Fix: add a `.gitattributes` "
+        "file to the repo root containing:\n```\n*.tflite -text\n```\n"
+        "then re-add and re-commit the model file from a fresh export."
     )
 
-    if ensure_file(MODEL_PATH, MODEL_URL, "TFLite model file", silent=True):
-        if not looks_like_valid_tflite(MODEL_PATH):
-            st.warning(f"'{MODEL_PATH}' was found but doesn't look like a valid TFLite file "
-                       f"(missing the TFL3 header). {corruption_hint}\n\nFalling back to "
-                       f"'{H5_MODEL_PATH}' for now.")
-        else:
-            try:
-                interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
-                interpreter.allocate_tensors()
-                return {"type": "tflite", "model": interpreter}
-            except Exception as e:
-                st.warning(f"Found '{MODEL_PATH}' but couldn't load it ({e}). "
-                           f"Falling back to '{H5_MODEL_PATH}'.")
+    if not ensure_file(MODEL_PATH, MODEL_URL, "TFLite model file"):
+        st.stop()
 
-    if ensure_file(H5_MODEL_PATH, H5_MODEL_URL, "Keras (.h5) model file"):
-        if not looks_like_valid_hdf5(H5_MODEL_PATH):
-            st.error(f"'{H5_MODEL_PATH}' was found but isn't a valid HDF5 file (wrong file "
-                     f"signature). {corruption_hint}")
-            st.stop()
-        st.info(
-            f"No usable '{MODEL_PATH}' found — loading '{H5_MODEL_PATH}' instead. This works "
-            "fine, but a valid TFLite conversion loads faster in Streamlit (optional speed-up)."
-        )
-        try:
-            keras_model = tf.keras.models.load_model(H5_MODEL_PATH)
-            return {"type": "keras", "model": keras_model}
-        except Exception as e:
-            st.error(f"Found a valid-looking '{H5_MODEL_PATH}' but Keras still couldn't load "
-                     f"it: {e}")
-            st.stop()
+    if not looks_like_valid_tflite(MODEL_PATH):
+        st.error(f"'{MODEL_PATH}' was found but doesn't look like a valid TFLite file "
+                 f"(missing the TFL3 header). {corruption_hint}")
+        st.stop()
 
-    st.stop()
+    interpreter = tflite.Interpreter(model_path=MODEL_PATH)
+    interpreter.allocate_tensors()
+    return {"type": "tflite", "model": interpreter}
 
 
 @st.cache_resource(show_spinner=False)
@@ -399,31 +365,18 @@ def classify_array(model_bundle, class_names, rgb_array: np.ndarray):
 
 
 def draw_pose_on_array(pose_detector, bgr_image):
-    """Detect + draw the pose skeleton. Also returns the raw normalized
-    landmarks (or None) so callers can run the orientation heuristic without
-    re-running pose detection a second time."""
     if pose_detector is None:
         return bgr_image, False, None
 
     rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-    result = pose_detector.detect(mp_image)
+    results = pose_detector.process(rgb)
 
     annotated = bgr_image.copy()
-    if not result.pose_landmarks:
+    if not results.pose_landmarks:
         return annotated, False, None
 
-    h, w, _ = annotated.shape
-    landmarks = result.pose_landmarks[0]  # first detected person
-    points = []
-    for lm in landmarks:
-        x, y = int(lm.x * w), int(lm.y * h)
-        points.append((x, y))
-        cv2.circle(annotated, (x, y), 4, (0, 255, 0), -1)
-    for start_idx, end_idx in POSE_CONNECTIONS:
-        cv2.line(annotated, points[start_idx], points[end_idx], (255, 0, 0), 2)
-
-    return annotated, True, landmarks
+    mp_drawing.draw_landmarks(annotated, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+    return annotated, True, results.pose_landmarks.landmark
 
 
 def estimate_body_orientation(landmarks):
