@@ -3,7 +3,51 @@ Elderly Fall / Activity Detection — Streamlit App (FA-2)
 =========================================================
 Loads the CNN trained in the companion Colab notebook
 (fall_detection_model.tflite + class_names.txt) and lets a caregiver
-upload an image, take a photo, or upload a video to classify activity.
+upload an image, take a photo, or upload a video to classify activity
+into one of 5 classes: Fall, Normal, Sitting, Standing, Walking.
+
+NEW IN THIS VERSION
+--------------------
+- Real-time monitoring panel (latest alert + live event timeline)
+- Fall / Normal / per-class activity counts
+- Emergency alert banner (kept, made more visible)
+- Activity distribution charts (kept)
+- Editable prediction log: caregiver can confirm the TRUE activity for any
+  prediction and tag Lighting / Camera angle / Occlusion for that capture.
+  This turns the running history into a small, growing evaluation set.
+- Confusion matrix + auto-generated "commonly confused classes" insights,
+  built live from the confirmed predictions above.
+- Correct fall detections / False alarms / Missed falls / Misclassified
+  activities counters, computed from confirmed predictions.
+- Prediction screenshot gallery (Falls / False alarms / Misclassified / All).
+- Environmental-factor analysis: false-alarm & accuracy rate broken down by
+  Lighting, Camera angle and Occlusion tag, so you can see which conditions
+  actually hurt the model in practice.
+- Diagnostic flags for two specific problems observed in testing:
+    1) Falls being classified as Sitting: a MediaPipe pose heuristic
+       estimates whether the body is lying horizontal vs upright. If the
+       body looks horizontal but the CNN did NOT say "Fall", the app raises
+       a caution ("pose says lying down, model said <label> — verify") and
+       logs it, so you can see how often this happens.
+    2) Walking never being detected: for video, the app compares consecutive
+       sampled frames for motion. If real motion is present but the CNN
+       predicts a static class (not Walking, not Fall), it's flagged as a
+       possible missed-Walking case.
+  These are runtime heuristics to help you SEE the problem and collect
+  evidence — they cannot fix the underlying CNN. The real fix is retraining
+  with more/varied "Fall" examples that look like sitting-on-floor poses,
+  and more "Walking" clips across different angles/speeds/lighting.
+- Class-name auto-check: on startup the app verifies that "Fall" and
+  "Walking" actually exist in class_names.txt (case-insensitively) and warns
+  you if the casing/spelling differs from what the app expects, since a
+  mismatch there would silently stop alerts from ever firing.
+- Video ground-truth selector: if an uploaded test video shows ONE known
+  activity for its whole duration, you can select that true activity before
+  running analysis. Every sampled frame's prediction is then automatically
+  compared against that label and feeds straight into the confusion matrix
+  below — no need to manually confirm each row in the editable log. (Only
+  use this for single-activity clips; for mixed-activity videos, leave it
+  as "Unconfirmed" and use the editable log instead.)
 
 Run with:
     streamlit run app.py
@@ -25,34 +69,59 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
-import tflite_runtime.interpreter as tflite
+import tensorflow as tf
 from PIL import Image
 
 import mediapipe as mp
-mp_pose = mp.solutions.pose
-mp_drawing = mp.solutions.drawing_utils
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
 
 # ----------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------
 IMG_SIZE = (128, 128)
 MODEL_PATH = "fall_detection_model.tflite"
+H5_MODEL_PATH = "fall_detection_model.h5"  # fallback if the TFLite conversion step wasn't run
 CLASS_NAMES_PATH = "class_names.txt"
 # If the model isn't found next to app.py (e.g. it's too big for a normal git
-# push), the app will try to download it from here. Use a direct-download
-# link (e.g. a GitHub Release asset URL) for files over ~50MB.
-MODEL_URL = ""
-CLASS_NAMES_URL = ""
+# push, or Git LFS wasn't pulled), the app will try to download it from here.
+# Use a direct-download link: a GitHub "Release" asset URL
+# (https://github.com/<user>/<repo>/releases/download/<tag>/<file>.tflite)
+# works well for files over ~50MB; raw.githubusercontent.com works for
+# smaller files committed normally (not via LFS).
+MODEL_URL = ""       # e.g. "https://github.com/you/repo/releases/download/v1/fall_detection_model.tflite"
+H5_MODEL_URL = ""    # same idea, for the .h5 fallback
+CLASS_NAMES_URL = ""  # optional, same idea for class_names.txt
 FALL_LABEL = "Fall"        # must match the class name used in class_names.txt exactly
 WALKING_LABEL = "Walking"  # must match the class name used in class_names.txt exactly
 VIDEO_SAMPLE_EVERY_N_FRAMES = 15  # classify roughly ~2 frames/sec at 30fps video
 THUMB_MAX_DIM = 220         # size of stored screenshot thumbnails
 
 # --- Diagnostic heuristic thresholds (tune these against your own footage) ---
+# Angle (degrees) from vertical, based on shoulder-to-hip line, above which the
+# body is considered "lying horizontal" — used to flag Fall-vs-Sitting confusion.
 HORIZONTAL_ANGLE_THRESHOLD = 55
+# Mean absolute pixel difference between consecutive sampled frames above which
+# we consider "real motion" present — used to flag missed Walking detections.
 MOTION_SCORE_THRESHOLD = 10
 
-# Environmental tagging options
+POSE_MODEL_PATH = "pose_landmarker.task"
+POSE_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+    "pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
+)
+# Standard 33-point BlazePose skeleton connections (stable across versions)
+POSE_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 7), (0, 4), (4, 5), (5, 6), (6, 8),
+    (9, 10), (11, 12), (11, 13), (13, 15), (15, 17), (15, 19), (15, 21), (17, 19),
+    (12, 14), (14, 16), (16, 18), (16, 20), (16, 22), (18, 20),
+    (11, 23), (12, 24), (23, 24), (23, 25), (24, 26), (25, 27), (26, 28),
+    (27, 29), (28, 30), (29, 31), (30, 32), (27, 31), (28, 32),
+]
+
+# Environmental tagging options — used to analyse WHY a prediction may have
+# been wrong (lighting, camera angle, occlusion), and to spot classes that
+# get confused because of similar body postures.
 UNCONFIRMED = "Unconfirmed"
 LIGHTING_OPTIONS = ["Not specified", "Good / even lighting", "Dim / low light",
                      "Overly bright / glare", "Backlit"]
@@ -66,13 +135,27 @@ st.set_page_config(page_title="Elderly Fall Detection", page_icon="🚨", layout
 
 def is_git_lfs_pointer(path: str) -> bool:
     """Detect the classic failure mode: the file 'exists' but is actually a
-    tiny Git LFS pointer (plain text) instead of the real binary."""
+    tiny Git LFS pointer (plain text) instead of the real binary, because LFS
+    objects weren't pulled during clone/deploy."""
     try:
         if os.path.getsize(path) > 2000:
             return False
         with open(path, "rb") as f:
             head = f.read(200)
         return head.startswith(b"version https://git-lfs.github.com/spec")
+    except OSError:
+        return False
+
+
+def looks_like_valid_hdf5(path: str) -> bool:
+    """Check the real HDF5 magic bytes, not just file size — catches a file
+    that 'exists' and isn't an LFS pointer but is still corrupted (e.g. Git
+    line-ending normalization mangled a binary file that wasn't marked as
+    binary via .gitattributes)."""
+    try:
+        with open(path, "rb") as f:
+            sig = f.read(8)
+        return sig == b"\x89HDF\r\n\x1a\n"
     except OSError:
         return False
 
@@ -90,7 +173,14 @@ def looks_like_valid_tflite(path: str) -> bool:
 
 def ensure_file(path: str, url: str, friendly_name: str, silent: bool = False) -> bool:
     """Make sure `path` exists and is a real file (not an LFS pointer).
-    Tries to download it from `url` if missing/broken and a URL was given."""
+    Tries to download it from `url` if missing/broken and a URL was given.
+    Shows a detailed diagnostic (cwd contents, LFS hint) instead of just
+    'not found' when it still can't locate a usable file — unless `silent`
+    is True, which is used for optional/fallback attempts where a failure
+    here isn't necessarily an error (e.g. trying TFLite before falling back
+    to a Keras .h5 model). Returns True if a usable file is available at
+    `path` afterwards.
+    """
     needs_download = not os.path.exists(path) or is_git_lfs_pointer(path)
 
     if needs_download and url:
@@ -114,17 +204,22 @@ def ensure_file(path: str, url: str, friendly_name: str, silent: bool = False) -
         if os.path.exists(path) and is_git_lfs_pointer(path):
             st.error(
                 f"⚠️ '{path}' exists but is only a Git LFS pointer file, not the real "
-                f"{friendly_name}. Fix by either: (1) running `git lfs pull` where you "
-                "deployed from, (2) enabling Git LFS support on your hosting platform, or "
-                f"(3) setting MODEL_URL / CLASS_NAMES_URL in app.py to a direct download link."
+                f"{friendly_name}. This happens when Git LFS objects weren't pulled during "
+                "deploy/clone. Fix by either: (1) running `git lfs pull` where you deployed "
+                "from, (2) enabling Git LFS support on your hosting platform, or "
+                f"(3) setting MODEL_URL / CLASS_NAMES_URL in app.py to a direct download link "
+                "(e.g. a GitHub Release asset) so the app fetches the real file itself."
             )
         else:
             st.error(
                 f"'{path}' not found. The app is currently running from: `{cwd}`, which "
                 f"contains: {nearby_files if nearby_files else '(nothing readable)'}. "
-                f"Check that {friendly_name} is committed to GitHub in this exact folder, "
-                "is under GitHub's ~100MB limit (or handled via Git LFS), and isn't excluded "
-                "by .gitignore."
+                f"If {friendly_name} is committed to GitHub but not showing up here, check: "
+                "the file is actually in this exact folder (not a subfolder) relative to "
+                "where app.py runs, it's under GitHub's ~100MB limit or handled via Git LFS "
+                "(and LFS was pulled), and it isn't excluded by .gitignore. Alternatively, set "
+                "MODEL_URL / CLASS_NAMES_URL near the top of app.py to a direct download link "
+                "and the app will fetch it automatically."
             )
         return False
 
@@ -132,7 +227,13 @@ def ensure_file(path: str, url: str, friendly_name: str, silent: bool = False) -
 
 
 def resolve_class_label(class_names, expected_label):
-    """Match `expected_label` against class_names.txt case-insensitively."""
+    """Match `expected_label` against class_names.txt case-insensitively.
+
+    Returns the exact string used in class_names.txt, or `expected_label`
+    unchanged if no match was found at all (with a warning shown to the user).
+    A mismatch here (e.g. file has 'fall' but the app expects 'Fall') would
+    otherwise silently prevent alerts from ever firing.
+    """
     for name in class_names:
         if name.strip().lower() == expected_label.strip().lower():
             return name
@@ -149,24 +250,58 @@ def resolve_class_label(class_names, expected_label):
 # ----------------------------------------------------------------------
 @st.cache_resource(show_spinner="Loading classification model...")
 def load_model():
+    """Returns a small bundle dict: {"type": "tflite"|"keras", "model": ...}.
+    Prefers a TFLite model (smaller, faster); falls back to loading the raw
+    Keras .h5 model directly if no .tflite conversion was ever committed.
+    Validates real file signatures (not just presence/size) so a corrupted
+    binary — the classic case being a .h5/.tflite committed without a
+    .gitattributes marking it as binary, so Git's line-ending normalization
+    silently rewrote bytes inside it — gets a clear diagnostic instead of a
+    raw OSError from deep inside TensorFlow/h5py.
+    """
     corruption_hint = (
         "This usually means the binary got corrupted in Git — most commonly because "
-        "there's no `.gitattributes` marking the file as binary. Fix: add a `.gitattributes` "
-        "file to the repo root containing:\n```\n*.tflite -text\n```\n"
-        "then re-add and re-commit the model file from a fresh export."
+        "there's no `.gitattributes` marking the file as binary, so Git's line-ending "
+        "normalization rewrote bytes inside it. Fix: add a `.gitattributes` file to the "
+        "repo root containing:\n"
+        "```\n*.h5 -text\n*.tflite -text\n```\n"
+        "then re-add and re-commit the model file(s) from a fresh export (you may need "
+        "`git rm --cached <file>` first, since the corrupted version is already in git "
+        "history) and push again."
     )
 
-    if not ensure_file(MODEL_PATH, MODEL_URL, "TFLite model file"):
-        st.stop()
+    if ensure_file(MODEL_PATH, MODEL_URL, "TFLite model file", silent=True):
+        if not looks_like_valid_tflite(MODEL_PATH):
+            st.warning(f"'{MODEL_PATH}' was found but doesn't look like a valid TFLite file "
+                       f"(missing the TFL3 header). {corruption_hint}\n\nFalling back to "
+                       f"'{H5_MODEL_PATH}' for now.")
+        else:
+            try:
+                interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
+                interpreter.allocate_tensors()
+                return {"type": "tflite", "model": interpreter}
+            except Exception as e:
+                st.warning(f"Found '{MODEL_PATH}' but couldn't load it ({e}). "
+                           f"Falling back to '{H5_MODEL_PATH}'.")
 
-    if not looks_like_valid_tflite(MODEL_PATH):
-        st.error(f"'{MODEL_PATH}' was found but doesn't look like a valid TFLite file "
-                 f"(missing the TFL3 header). {corruption_hint}")
-        st.stop()
+    if ensure_file(H5_MODEL_PATH, H5_MODEL_URL, "Keras (.h5) model file"):
+        if not looks_like_valid_hdf5(H5_MODEL_PATH):
+            st.error(f"'{H5_MODEL_PATH}' was found but isn't a valid HDF5 file (wrong file "
+                     f"signature). {corruption_hint}")
+            st.stop()
+        st.info(
+            f"No usable '{MODEL_PATH}' found — loading '{H5_MODEL_PATH}' instead. This works "
+            "fine, but a valid TFLite conversion loads faster in Streamlit (optional speed-up)."
+        )
+        try:
+            keras_model = tf.keras.models.load_model(H5_MODEL_PATH)
+            return {"type": "keras", "model": keras_model}
+        except Exception as e:
+            st.error(f"Found a valid-looking '{H5_MODEL_PATH}' but Keras still couldn't load "
+                     f"it: {e}")
+            st.stop()
 
-    interpreter = tflite.Interpreter(model_path=MODEL_PATH)
-    interpreter.allocate_tensors()
-    return {"type": "tflite", "model": interpreter}
+    st.stop()
 
 
 @st.cache_resource(show_spinner=False)
@@ -179,7 +314,11 @@ def load_class_names():
 
 @st.cache_resource(show_spinner="Loading pose model...")
 def load_pose_detector():
-    return mp_pose.Pose(static_image_mode=True, model_complexity=1, min_detection_confidence=0.5)
+    if not os.path.exists(POSE_MODEL_PATH):
+        urllib.request.urlretrieve(POSE_MODEL_URL, POSE_MODEL_PATH)
+    base_options = mp_python.BaseOptions(model_asset_path=POSE_MODEL_PATH)
+    options = vision.PoseLandmarkerOptions(base_options=base_options)
+    return vision.PoseLandmarker.create_from_options(options)
 
 
 # ----------------------------------------------------------------------
@@ -202,13 +341,25 @@ def array_to_thumb_bytes(rgb_array: np.ndarray, max_dim: int = THUMB_MAX_DIM) ->
 
 
 def log_prediction(label: str, confidence: float, source: str, thumb: bytes = None,
-                    pose_flag: bool = False, motion_flag: bool = False, pose_angle=None):
+                    pose_flag: bool = False, motion_flag: bool = False, pose_angle=None,
+                    actual_label: str = UNCONFIRMED):
+    """Append a new prediction to the running history / evaluation log.
+
+    pose_flag / motion_flag are runtime diagnostic hints (not ground truth):
+    pose_flag  = pose orientation looked horizontal/lying but label wasn't Fall
+    motion_flag = real motion was detected between frames but label wasn't Walking/Fall
+
+    actual_label lets a caller supply a known ground-truth label up front
+    (e.g. "this whole test video is Walking") instead of leaving it as
+    UNCONFIRMED for later manual confirmation in the editable log. Frames
+    logged with a real actual_label flow straight into the confusion matrix.
+    """
     entry = {
-        "label": label,
+        "label": label,               # what the model predicted
         "confidence": confidence,
-        "source": source,
+        "source": source,             # image / camera / video
         "timestamp": time.time(),
-        "actual_label": UNCONFIRMED,
+        "actual_label": actual_label,  # ground truth, if known up front; else UNCONFIRMED
         "lighting": "Not specified",
         "camera_angle": "Not specified",
         "occlusion": "Not specified",
@@ -230,24 +381,29 @@ def reset_session():
 # Core logic
 # ----------------------------------------------------------------------
 def classify_array(model_bundle, class_names, rgb_array: np.ndarray):
-    """Resize/normalize an RGB numpy image and run the TFLite classifier."""
+    """Resize/normalize an RGB numpy image and run the classifier, whether
+    it's a TFLite interpreter or a raw Keras model."""
     img = Image.fromarray(rgb_array).convert("RGB").resize(IMG_SIZE)
     arr = np.array(img).astype("float32") / 255.0
     arr = np.expand_dims(arr, axis=0)
 
-    interpreter = model_bundle["model"]
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
-    interpreter.set_tensor(input_details[0]['index'], arr)
-    interpreter.invoke()
-    probs = interpreter.get_tensor(output_details[0]['index'])[0]
+    if model_bundle["type"] == "tflite":
+        interpreter = model_bundle["model"]
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+        interpreter.set_tensor(input_details[0]['index'], arr)
+        interpreter.invoke()
+        probs = interpreter.get_tensor(output_details[0]['index'])[0]
+    else:  # "keras"
+        keras_model = model_bundle["model"]
+        probs = keras_model.predict(arr, verbose=0)[0]
 
     pred_idx = int(np.argmax(probs))
     if pred_idx >= len(class_names):
         st.error(
             f"Model predicts {len(probs)} classes but class_names.txt only has "
             f"{len(class_names)} entries. Re-export fall_detection_model.tflite "
-            "and re-upload class_names.txt so they match."
+            "from your 5-class training run and re-upload class_names.txt."
         )
         st.stop()
     label = class_names[pred_idx]
@@ -256,28 +412,41 @@ def classify_array(model_bundle, class_names, rgb_array: np.ndarray):
 
 
 def draw_pose_on_array(pose_detector, bgr_image):
-    """Detect + draw the pose skeleton. Also returns the raw landmarks (or
-    None) so callers can run the orientation heuristic without re-running
-    pose detection a second time."""
+    """Detect + draw the pose skeleton. Also returns the raw normalized
+    landmarks (or None) so callers can run the orientation heuristic without
+    re-running pose detection a second time."""
     if pose_detector is None:
         return bgr_image, False, None
 
     rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
-    results = pose_detector.process(rgb)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    result = pose_detector.detect(mp_image)
 
     annotated = bgr_image.copy()
-    if not results.pose_landmarks:
+    if not result.pose_landmarks:
         return annotated, False, None
 
-    mp_drawing.draw_landmarks(annotated, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
-    return annotated, True, results.pose_landmarks.landmark
+    h, w, _ = annotated.shape
+    landmarks = result.pose_landmarks[0]  # first detected person
+    points = []
+    for lm in landmarks:
+        x, y = int(lm.x * w), int(lm.y * h)
+        points.append((x, y))
+        cv2.circle(annotated, (x, y), 4, (0, 255, 0), -1)
+    for start_idx, end_idx in POSE_CONNECTIONS:
+        cv2.line(annotated, points[start_idx], points[end_idx], (255, 0, 0), 2)
+
+    return annotated, True, landmarks
 
 
 def estimate_body_orientation(landmarks):
     """Rough "standing vs lying down" signal from the shoulder->hip line.
+
     Uses BlazePose indices: 11/12 = left/right shoulder, 23/24 = left/right hip.
-    Returns the angle in degrees from vertical (0 = upright, 90 = lying), or
-    None if the needed landmarks aren't available."""
+    Returns the angle in degrees between that line and the vertical axis
+    (0 = perfectly upright, 90 = perfectly horizontal/lying), or None if the
+    needed landmarks aren't available.
+    """
     if not landmarks or len(landmarks) < 25:
         return None
     try:
@@ -329,6 +498,7 @@ def render_realtime_monitor():
     else:
         st.success(f"Most recent capture: **{last['label']}** — no fall currently detected.")
 
+    # Live timeline of fall vs non-fall events across the session
     history = st.session_state.history
     if len(history) >= 2:
         timeline_df = pd.DataFrame(
@@ -346,7 +516,9 @@ def render_editable_log(class_names):
     st.caption(
         "For any capture, set the TRUE activity if the model got it wrong, and "
         "optionally tag the lighting / camera angle / occlusion at capture time. "
-        "This builds the data used for the confusion matrix and condition analysis below."
+        "This builds the data used for the confusion matrix and condition analysis below. "
+        "(Frames from a video where you selected a known true activity up front are "
+        "already pre-filled here.)"
     )
     history = st.session_state.history
     if not history:
@@ -377,6 +549,7 @@ def render_editable_log(class_names):
         },
     )
 
+    # Write edits back into session state history
     for _, row in edited_df.iterrows():
         i = int(row["idx"])
         st.session_state.history[i]["actual_label"] = row["actual_label"]
@@ -393,7 +566,8 @@ def get_confirmed_df(class_names):
     confirmed = [h for h in history if h["actual_label"] != UNCONFIRMED]
     if not confirmed:
         return None
-    return pd.DataFrame(confirmed)
+    df = pd.DataFrame(confirmed)
+    return df
 
 
 def render_confusion_matrix(class_names):
@@ -401,8 +575,9 @@ def render_confusion_matrix(class_names):
     df = get_confirmed_df(class_names)
     if df is None:
         st.caption(
-            "No confirmed predictions yet. Use the editable log above to set the "
-            "TRUE activity for at least a few captures to build a confusion matrix."
+            "No confirmed predictions yet. Either select a true activity before running "
+            "a video analysis (Upload Video tab), or use the editable log above to set "
+            "the TRUE activity for individual captures."
         )
         return
 
@@ -425,6 +600,7 @@ def render_confusion_matrix(class_names):
     c5.metric("🙈 Missed falls", missed_falls)
     c6.metric("❓ Other misclassified", max(other_misclassified, 0))
 
+    # Build confusion matrix over the full class list so every class shows up
     crosstab = pd.crosstab(df["actual_label"], df["label"])
     crosstab = crosstab.reindex(index=class_names, columns=class_names, fill_value=0)
 
@@ -446,6 +622,8 @@ def render_confusion_matrix(class_names):
     fig.tight_layout()
     st.pyplot(fig)
 
+    # Auto-generated "commonly confused classes" insight — useful for spotting
+    # similar-body-posture issues (e.g. Sitting vs Fall, Standing vs Walking).
     insights = []
     for actual_cls, pred_cls in itertools.permutations(class_names, 2):
         count = crosstab.loc[actual_cls, pred_cls]
@@ -541,7 +719,7 @@ def render_screenshot_gallery():
             st.caption("Nothing in this category yet.")
             return
         cols = st.columns(3)
-        for i, h in enumerate(entries[-9:]):
+        for i, h in enumerate(entries[-9:]):  # most recent 9 to keep it light
             with cols[i % 3]:
                 st.image(h["thumb"], use_container_width=True)
                 caption = f"{h['label']} ({h['confidence']:.0%})"
@@ -596,8 +774,8 @@ def render_diagnostic_flags():
     st.subheader("🩺 Model Diagnostic Flags")
     st.caption(
         "These are runtime heuristics — not ground truth — meant to help you SEE "
-        "and collect evidence for known problems, since they can only be fixed "
-        "by retraining the CNN with better data, not by this app alone."
+        "and collect evidence for two known problems, since neither can be fixed "
+        "by this app alone (both trace back to the CNN's training data)."
     )
     history = st.session_state.history
     if not history:
@@ -623,11 +801,13 @@ def render_diagnostic_flags():
                     f"body angle from upright: {angle_txt}"
                 )
             st.markdown(
-                "**Likely cause:** training Fall images may mostly show a person already "
-                "still/sprawled on the floor, while Sitting shares a similar low silhouette. "
-                "**To fix at the source:** add more Fall training images across the full "
-                "falling motion and multiple camera angles, and ensure Sitting examples use "
-                "the same camera angles."
+                "**Likely cause:** the CNN was probably trained on Fall images that mostly "
+                "look like a person already still/sprawled on the floor, while Sitting images "
+                "share a similar low, folded silhouette from this camera angle. "
+                "**To fix at the source:** add more Fall training images captured at the "
+                "moment of/just after falling (not only the resting position), across "
+                "multiple camera angles, and make sure Sitting examples include the same "
+                "camera angles so the two classes aren't separable by camera position alone."
             )
 
     if motion_flagged:
@@ -638,9 +818,12 @@ def render_diagnostic_flags():
                     cols[0].image(h["thumb"], use_container_width=True)
                 cols[1].write(f"Predicted **{h['label']}** ({h['confidence']:.0%})")
             st.markdown(
-                "**Likely cause:** Walking training data may be limited in camera angle, "
-                "speed, or lighting. **To fix at the source:** add Walking clips from the "
-                "actual deployed camera position, at varied speeds/lighting."
+                "**Likely cause:** the Walking class in training was probably limited in "
+                "camera angle, walking speed, or lighting compared to real usage. "
+                "**To fix at the source:** add Walking clips from the actual camera "
+                "position(s) this app will run with, at varied speeds and lighting, and "
+                "check `class_names.txt` / the model output layer to confirm Walking is "
+                "actually one of the trained classes (see the class-name check at startup)."
             )
 
     if not pose_flagged and not motion_flagged:
@@ -650,7 +833,18 @@ def render_diagnostic_flags():
 # ----------------------------------------------------------------------
 # Video processing
 # ----------------------------------------------------------------------
-def process_video(model, class_names, pose_detector, video_path: str, show_pose: bool):
+def process_video(model, class_names, pose_detector, video_path: str, show_pose: bool,
+                   true_label: str = UNCONFIRMED):
+    """Samples frames from an uploaded video, classifies each, logs results,
+    and shows a live progress bar plus a summary once done.
+
+    true_label: if the whole video shows ONE known activity (e.g. a labeled
+    test clip), pass that class name here. Every sampled frame's prediction
+    is then logged with that as its ground-truth actual_label, so it flows
+    straight into the confusion matrix without manual per-row confirmation.
+    Leave as UNCONFIRMED for mixed-activity videos and confirm rows manually
+    afterward in the editable log instead.
+    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         st.error("Could not open the uploaded video.")
@@ -662,9 +856,10 @@ def process_video(model, class_names, pose_detector, video_path: str, show_pose:
     processed = 0
     fall_frame_preview = None
     last_annotated_preview = None
-    prev_gray = None
+    prev_gray = None  # for motion detection between sampled frames
     pose_flag_count = 0
     motion_flag_count = 0
+    correct_count = 0  # only meaningful when true_label is known
 
     while True:
         ret, frame_bgr = cap.read()
@@ -683,6 +878,7 @@ def process_video(model, class_names, pose_detector, video_path: str, show_pose:
             else:
                 preview_rgb = rgb
 
+            # Motion check: compare this sampled frame to the previous one
             gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
             gray = cv2.GaussianBlur(gray, (5, 5), 0)
             motion_score = 0.0
@@ -697,9 +893,13 @@ def process_video(model, class_names, pose_detector, video_path: str, show_pose:
             pose_flag_count += int(pose_flag)
             motion_flag_count += int(motion_flag)
 
+            if true_label != UNCONFIRMED and label == true_label:
+                correct_count += 1
+
             thumb = array_to_thumb_bytes(preview_rgb)
             log_prediction(label, probs[label], source="video", thumb=thumb,
-                            pose_flag=pose_flag, motion_flag=motion_flag, pose_angle=pose_angle)
+                            pose_flag=pose_flag, motion_flag=motion_flag, pose_angle=pose_angle,
+                            actual_label=true_label)
             processed += 1
             last_annotated_preview = preview_rgb
 
@@ -712,6 +912,14 @@ def process_video(model, class_names, pose_detector, video_path: str, show_pose:
     cap.release()
     progress.empty()
     st.success(f"Video processed: {processed} frames analyzed.")
+
+    if true_label != UNCONFIRMED and processed > 0:
+        st.info(
+            f"Ground truth for this clip: **{true_label}**. "
+            f"{correct_count}/{processed} sampled frames ({correct_count / processed:.1%}) "
+            f"were predicted correctly. These frames have been added to the confusion "
+            f"matrix below."
+        )
 
     if fall_frame_preview is not None:
         st.error("🚨 A fall was detected at least once in this video.")
@@ -755,6 +963,7 @@ FALL_LABEL = resolve_class_label(class_names, FALL_LABEL)
 WALKING_LABEL = resolve_class_label(class_names, WALKING_LABEL)
 pose_detector = load_pose_detector() if show_pose else None
 
+# Real-time monitoring panel sits at the top so it's always visible
 render_realtime_monitor()
 st.markdown("---")
 
@@ -860,6 +1069,20 @@ with tab_video:
         f"Frames are sampled every {VIDEO_SAMPLE_EVERY_N_FRAMES} frames "
         "(not every single frame) to keep processing fast."
     )
+
+    true_label_choice = st.selectbox(
+        "True activity shown in this video (optional, for auto confusion matrix)",
+        options=[UNCONFIRMED] + class_names,
+        index=0,
+        key="video_true_label",
+        help="If this is a test clip where the WHOLE video shows one known activity, "
+             "select it here. Every sampled frame's prediction is then automatically "
+             "compared against this label and feeds straight into the confusion matrix "
+             "below — no manual row-by-row confirmation needed. Leave as 'Unconfirmed' "
+             "for mixed-activity or real-world monitoring footage, and confirm rows "
+             "manually afterward in the editable log instead."
+    )
+
     video_file = st.file_uploader("Choose a video", type=["mp4", "mov", "avi", "mkv"], key="video_uploader")
     if video_file is not None:
         st.video(video_file)
@@ -868,7 +1091,8 @@ with tab_video:
             with open(temp_path, "wb") as f:
                 f.write(video_file.getbuffer())
             try:
-                process_video(model, class_names, pose_detector, temp_path, show_pose)
+                process_video(model, class_names, pose_detector, temp_path, show_pose,
+                               true_label=true_label_choice)
             finally:
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
