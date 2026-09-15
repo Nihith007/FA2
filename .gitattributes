@@ -1,6 +1,3 @@
 *.h5 -text
 *.tflite -text
 *.task -text
-git add .gitattributes fall_detection_model.h5 fall_detection_model.tflite
-git commit -m "Fix binary model files corrupted by line-ending normalization"
-git push
