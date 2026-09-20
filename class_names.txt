@@ -1,5 +1,5 @@
 fall
+normal
 sitting
 standing
 walking
-normal
